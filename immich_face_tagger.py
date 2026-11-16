@@ -56,7 +56,7 @@ def search_recent_assets(since: datetime):
 
 
 def asset_has_faces(asset_id: str) -> bool:
-    faces = api("GET", f"/faces?assetId={asset_id}").json()
+    faces = api("GET", f"/faces?id={asset_id}").json()
     return len(faces) > 0
 
 
