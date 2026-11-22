@@ -16,6 +16,10 @@ POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "300"))      # 5 minutes
 LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "48"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "100"))
 
+TARGET_PERSON_ID = os.getenv("TARGET_PERSON_ID", "").strip()
+SHARED_ALBUM_ID = os.getenv("SHARED_ALBUM_ID", "").strip()
+UNARCHIVE_SHARED_ASSETS = os.getenv("UNARCHIVE_SHARED_ASSETS", "false").lower() in ("1", "true", "yes")
+
 if not API_KEY:
     raise SystemExit("IMMICH_API_KEY is required")
 
@@ -46,11 +50,13 @@ def get_or_create_tag(name: str) -> str:
     return created["id"]
 
 
-def search_recent_assets(since: datetime):
+def search_recent_assets(since: datetime, person_ids: list[str] | None = None):
     body = {
         "createdAfter": since.isoformat().replace("+00:00", "Z"),
         "size": BATCH_SIZE,
     }
+    if person_ids:
+        body["personIds"] = person_ids
     result = api("POST", "/search/metadata", json=body).json()
     return result.get("assets", {}).get("items", [])
 
@@ -70,6 +76,44 @@ def apply_tag(asset_ids: list[str], tag_id: str):
     log.info("Tagged %d asset(s) with '%s'", len(asset_ids), TARGET_TAG_NAME)
 
 
+def get_existing_album_asset_ids(album_id: str) -> set[str]:
+    album = api("GET", f"/albums/{album_id}").json()
+    return {a["id"] for a in album.get("assets", []) if "id" in a}
+
+
+def unarchive_asset(asset_id: str):
+    api("PUT", f"/assets/{asset_id}", json={"isArchived": False})
+
+
+def add_assets_to_shared_album(since: datetime):
+    if not TARGET_PERSON_ID or not SHARED_ALBUM_ID:
+        return
+
+    matched_assets = search_recent_assets(since, person_ids=[TARGET_PERSON_ID])
+    if not matched_assets:
+        return
+
+    existing_ids = get_existing_album_asset_ids(SHARED_ALBUM_ID)
+    new_assets = [a for a in matched_assets if a.get("id") and a["id"] not in existing_ids]
+    if not new_assets:
+        return
+
+    ids_to_add = []
+    for asset in new_assets:
+        asset_id = asset["id"]
+        if UNARCHIVE_SHARED_ASSETS and asset.get("isArchived"):
+            try:
+                unarchive_asset(asset_id)
+                log.info("Unarchived asset %s before adding to shared album", asset_id)
+            except Exception as e:
+                log.warning("Could not unarchive %s: %s", asset_id, e)
+        ids_to_add.append(asset_id)
+
+    if ids_to_add:
+        api("PUT", f"/albums/{SHARED_ALBUM_ID}/assets", json={"ids": ids_to_add})
+        log.info("Added %d asset(s) for person %s to album %s", len(ids_to_add), TARGET_PERSON_ID, SHARED_ALBUM_ID)
+
+
 def process_once(tag_id: str):
     since = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
     log.info("Scanning assets created after %s", since.isoformat())
@@ -81,7 +125,6 @@ def process_once(tag_id: str):
     for asset in assets:
         asset_id = asset["id"]
 
-        # Skip if already tagged
         existing = {t["id"] for t in asset.get("tags", [])}
         if tag_id in existing:
             continue
@@ -94,9 +137,17 @@ def process_once(tag_id: str):
 
     apply_tag(to_tag, tag_id)
 
+    try:
+        add_assets_to_shared_album(since)
+    except Exception as e:
+        log.warning("Could not sync person %s to album %s: %s", TARGET_PERSON_ID, SHARED_ALBUM_ID, e)
+
 
 def main():
     log.info("Starting face tagger (poll every %ds)", POLL_INTERVAL)
+    if (TARGET_PERSON_ID and not SHARED_ALBUM_ID) or (SHARED_ALBUM_ID and not TARGET_PERSON_ID):
+        log.warning("Both TARGET_PERSON_ID and SHARED_ALBUM_ID are required for auto-album sync")
+
     tag_id = get_or_create_tag(TARGET_TAG_NAME)
 
     while True:
