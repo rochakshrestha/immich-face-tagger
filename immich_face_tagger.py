@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
+import logging
 import os
 import time
-import logging
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -19,6 +19,7 @@ BATCH_SIZE = int(os.getenv("BATCH_SIZE", "100"))
 TARGET_PERSON_ID = os.getenv("TARGET_PERSON_ID", "").strip()
 SHARED_ALBUM_ID = os.getenv("SHARED_ALBUM_ID", "").strip()
 UNARCHIVE_SHARED_ASSETS = os.getenv("UNARCHIVE_SHARED_ASSETS", "false").lower() in ("1", "true", "yes")
+ARCHIVE_SHARED_ASSETS = os.getenv("ARCHIVE_SHARED_ASSETS", "false").lower() in ("1", "true", "yes")
 
 if not API_KEY:
     raise SystemExit("IMMICH_API_KEY is required")
@@ -34,7 +35,7 @@ def api(method, path, **kwargs):
     url = f"{IMMICH_URL}{path}"
     r = requests.request(method, url, headers=headers, timeout=30, **kwargs)
     if r.status_code >= 400:
-        log.error("%s %s → %s %s", method, path, r.status_code, r.text[:300])
+        log.error("%s %s -> %s %s", method, path, r.status_code, r.text[:300])
         r.raise_for_status()
     return r
 
@@ -81,11 +82,11 @@ def get_existing_album_asset_ids(album_id: str) -> set[str]:
     return {a["id"] for a in album.get("assets", []) if "id" in a}
 
 
-def unarchive_asset(asset_id: str):
-    api("PUT", f"/assets/{asset_id}", json={"isArchived": False})
+def set_asset_archived(asset_id: str, archived: bool):
+    api("PUT", f"/assets/{asset_id}", json={"isArchived": archived})
 
 
-def add_assets_to_shared_album(since: datetime):
+def sync_person_to_shared_album(since: datetime):
     if not TARGET_PERSON_ID or not SHARED_ALBUM_ID:
         return
 
@@ -101,17 +102,27 @@ def add_assets_to_shared_album(since: datetime):
     ids_to_add = []
     for asset in new_assets:
         asset_id = asset["id"]
-        if UNARCHIVE_SHARED_ASSETS and asset.get("isArchived"):
+        if UNARCHIVE_SHARED_ASSETS and not ARCHIVE_SHARED_ASSETS and asset.get("isArchived"):
             try:
-                unarchive_asset(asset_id)
+                set_asset_archived(asset_id, False)
                 log.info("Unarchived asset %s before adding to shared album", asset_id)
             except Exception as e:
                 log.warning("Could not unarchive %s: %s", asset_id, e)
         ids_to_add.append(asset_id)
 
-    if ids_to_add:
-        api("PUT", f"/albums/{SHARED_ALBUM_ID}/assets", json={"ids": ids_to_add})
-        log.info("Added %d asset(s) for person %s to album %s", len(ids_to_add), TARGET_PERSON_ID, SHARED_ALBUM_ID)
+    if not ids_to_add:
+        return
+
+    api("PUT", f"/albums/{SHARED_ALBUM_ID}/assets", json={"ids": ids_to_add})
+    log.info("Added %d asset(s) for person %s to album %s", len(ids_to_add), TARGET_PERSON_ID, SHARED_ALBUM_ID)
+
+    if ARCHIVE_SHARED_ASSETS:
+        for asset_id in ids_to_add:
+            try:
+                set_asset_archived(asset_id, True)
+                log.info("Archived asset %s after adding to shared album", asset_id)
+            except Exception as e:
+                log.warning("Could not archive %s: %s", asset_id, e)
 
 
 def process_once(tag_id: str):
@@ -138,7 +149,7 @@ def process_once(tag_id: str):
     apply_tag(to_tag, tag_id)
 
     try:
-        add_assets_to_shared_album(since)
+        sync_person_to_shared_album(since)
     except Exception as e:
         log.warning("Could not sync person %s to album %s: %s", TARGET_PERSON_ID, SHARED_ALBUM_ID, e)
 
